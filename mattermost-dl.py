@@ -4,9 +4,13 @@ from datetime import datetime, date
 from typing import Tuple, Dict, List
 import getpass
 
-from mattermostdriver import Driver
+from mattermostdriver import Driver, exceptions
 import pathlib
 import json
+
+from appdirs import *
+
+import argparse
 
 
 def connect(host: str, login_token: str = None, username: str = None, password: str = None) -> Driver:
@@ -43,22 +47,27 @@ def get_users(d: Driver) -> Tuple[Dict[str, str], str]:
     return user_id_to_name, my_user_id
 
 
-def select_team(d: Driver, my_user_id: str) -> str:
+def select_team(d: Driver, my_user_id: str, direct_message: bool = False) -> str:
     print("Downloading all team information... ", end="")
     teams = d.teams.get_user_teams(my_user_id)
     print(f"Found {len(teams)} teams!")
     for i_team, team in enumerate(teams):
         print(f"{i_team}\t{team['name']}\t({team['id']})")
-    team_idx = int(input("Select team by idx: "))
+    # if direct message, select the first team as not used in the end
+    if direct_message == True:
+        team_idx = 1
+    else:
+        team_idx = int(input("Select team by idx: "))
     team = teams[team_idx]
     print(f"Selected team {team['name']}")
     return team
 
 
 def select_channel(d: Driver, team: str, my_user_id: str, user_id_to_name: Dict[str, str],
-                   verbose: bool = False) -> List[str]:
+                   verbose: bool = False, is_strict: bool = False, direct_message: bool = False) -> List[str]:
     print("Downloading all channel information... ", end="")
     channels = d.channels.get_channels_for_user(my_user_id, team["id"])
+
     # Add display name to direct messages
     for channel in channels:
         if channel["type"] != "D":
@@ -67,7 +76,21 @@ def select_channel(d: Driver, team: str, my_user_id: str, user_id_to_name: Dict[
         # The channel name consists of two user ids connected by a double underscore
         user_ids = channel["name"].split("__")
         other_user_id = user_ids[1] if user_ids[0] == my_user_id else user_ids[0]
+        try:
+            user_id_to_name[other_user_id] = d.users.get_user(other_user_id)["username"]
+        except exceptions.ResourceNotFound:
+            user_id_to_name[other_user_id] = other_user_id
+
         channel["display_name"] = user_id_to_name[other_user_id]
+
+    # only keep actual channels, not direct messages
+    if direct_message:
+        direct_channels = [channel for channel in channels if (channel["type"] == "D" or channel["type"] == "G")]
+        channels = direct_channels
+    elif is_strict:
+        strict_channels = [channel for channel in channels if (channel["type"] != "D" and channel["type"] != "G")]
+        channels = strict_channels
+
     # Sort channels by name for easier search
     channels = sorted(channels, key=lambda x: x["display_name"].lower())
     print(f"Found {len(channels)} channels!")
@@ -160,7 +183,8 @@ def export_channel(d: Driver, channel: str, user_id_to_name: Dict[str, str], out
                         except:
                             print("Downloading file failed")
                     # Mattermost Driver unfortunately parses json files to dicts
-                    if isinstance(resp, dict):
+                    if isinstance(resp, (dict, list)):
+                        #                    if isinstance(resp, dict):
                         with open(output_base / filename, "w") as f:
                             json.dump(resp, f)
                     else:
@@ -171,13 +195,18 @@ def export_channel(d: Driver, channel: str, user_id_to_name: Dict[str, str], out
             simple_post["files"] = filenames
         simple_posts.append(simple_post)
 
+    try:
+        team = d.teams.get_team(channel["team_id"])["name"]
+    except exceptions.ResourceNotFound:
+        team = channel["team_id"]
+
     output = {
         "channel": {
             "name": channel["name"],
             "display_name": channel["display_name"],
             "header": channel["header"],
             "id": channel["id"],
-            "team": d.teams.get_team(channel["team_id"])["name"],
+            "team": team,
             "team_id": channel["team_id"],
             "exported_at": datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ')
         },
@@ -272,14 +301,26 @@ def complete_config(config: dict, config_filename: str = "config.json") -> dict:
 
 
 def find_mmauthtoken_firefox(host):
-    appdata_dir = pathlib.Path(os.environ["APPDATA"])
-    profiles_dir = appdata_dir / "Mozilla/Firefox/Profiles"
-    cookie_files = profiles_dir.rglob("cookies.sqlite")
+    appname = "Firefox"
+    appauthor = "Mozilla"
+
+    appdata_dir = user_data_dir(appname, appauthor)
+    profiles_dir = appdata_dir / "Profiles"
+    cookie_files = profiles_dir.rglob("*")
+
+    #    appdata_dir =  pathlib.Path("/Users/praverdy/Library/Application\ Support")
+    #    profiles_dir = appdata_dir / "Firefox/Profiles/"
+    #    cookie_files = profiles_dir.rglob("*")
+
+    #    cookie_files = ["/Users/praverdy/Library/Application Support/Firefox/Profiles/f7g19yc2.default-release/cookies.sqlite"]
+    print(profiles_dir)
+
+    print(sorted(cookie_files))
 
     all_tokens = []
     for cookie_file in cookie_files:
         print(f"Opening {cookie_file}")
-        connection = sqlite3.connect(str(cookie_file))
+        connection = sqlite3.connect(cookie_file)
         cursor = connection.cursor()
         rows = cursor.execute("SELECT host, value FROM moz_cookies WHERE name = 'MMAUTHTOKEN'").fetchall()
         all_tokens.extend(rows)
@@ -303,6 +344,15 @@ if __name__ == '__main__':
     config = get_config_from_json()
     config = complete_config(config)
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--is_strict",
+                        help="If set, only download content from channels in team",
+                        action="store_true")
+    parser.add_argument("--direct_message",
+                        help="If set, download all personal messages (direct and group). Priority over is_strict.",
+                        action="store_true")
+    args = parser.parse_args()
+
     output_base = "results/" + date.today().strftime("%Y%m%d")
     print(f"Storing downloaded data in {output_base}")
 
@@ -313,8 +363,8 @@ if __name__ == '__main__':
     d = connect(config["host"], config.get("token", None),
                 config.get("username", None), config.get("password", None))
     user_id_to_name, my_user_id = get_users(d)
-    team = select_team(d, my_user_id)
-    channels = select_channel(d, team, my_user_id, user_id_to_name)
+    team = select_team(d, my_user_id, direct_message=args.direct_message)
+    channels = select_channel(d, team, my_user_id, user_id_to_name, direct_message=args.direct_message, is_strict=args.is_strict)
     for i_channel, channel in enumerate(channels):
         print(f"Start export of channel {i_channel + 1}/{len(channels)}")
         export_channel(d, channel, user_id_to_name, output_base, config["download_files"],
